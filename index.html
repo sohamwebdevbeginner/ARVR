@@ -229,16 +229,22 @@ async function startAR() {
     alert('AR is not supported on this device/browser.');
     return;
   }
+  let step = 'request session';
   try {
+    // Keep the session request minimal: extra features (like dom-overlay) can make it fail on some phones.
     const session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test'],
-      optionalFeatures: ['dom-overlay'],
-      domOverlay: { root: document.body },
     });
     xrSession = session;
+
+    step = 'attach renderer';
+    renderer.xr.setReferenceSpaceType('local');
     await renderer.xr.setSession(session);
 
+    step = 'create viewer space';
     const viewerSpace = await session.requestReferenceSpace('viewer');
+
+    step = 'create hit test';
     hitSource = await session.requestHitTestSource({ space: viewerSpace });
 
     arActive = true;
@@ -258,7 +264,7 @@ async function startAR() {
       setMode(mode);
     });
   } catch (err) {
-    alert('Could not start AR: ' + err.message);
+    alert('Could not start AR at step "' + step + '": ' + err.name + ' - ' + err.message);
   }
 }
 
