@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room Solar Grid</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: system-ui, sans-serif; background: #111; }
+  #ui { position: fixed; top: 10px; left: 10px; right: 10px; display: flex; gap: 8px; flex-wrap: wrap; z-index: 2; }
+  button { padding: 9px 12px; border: 0; border-radius: 8px; background: #fff; font-size: 14px; cursor: pointer; }
+  button.on { background: #f5b400; }
+  #info { position: fixed; bottom: 10px; left: 10px; right: 10px; color: #fff; background: rgba(0,0,0,.55);
+          padding: 8px 10px; border-radius: 8px; font-size: 13px; z-index: 2; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="ui">
+  <button id="btnGrid" class="on">Place grid</button>
+  <button id="btnPanel">Toggle panels</button>
+  <button id="btnDelete">Delete grid</button>
+  <button id="btnAR">Start AR (Android)</button>
+</div>
+<div id="info">
+  <div id="hint"></div>
+  <div id="stats"></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---- Settings (metres) ----
+const ROOM_W = 4, ROOM_D = 5, ROOM_H = 2.5;   // room size
+const CELL = 0.5, COLS = 6, ROWS = 4;          // grid: 3 m x 2 m, 0.5 m cells
+
+// ---- Renderer / scene / camera ----
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1d2026);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.05, 100);
+camera.position.set(0, 1.6, ROOM_D / 2 - 0.3);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.2, -ROOM_D / 2 + 0.5);
+controls.minDistance = 0.5;
+controls.maxDistance = 15;
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+sun.position.set(2, 4, 3);
+scene.add(sun);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---- Room (virtual, for desktop preview) ----
+const room = new THREE.Group();
+scene.add(room);
+
+const wallMat = new THREE.MeshStandardMaterial({ color: 0xe8e4da, side: THREE.DoubleSide });
+const floorMat = new THREE.MeshStandardMaterial({ color: 0x9c8566, side: THREE.DoubleSide });
+const surfaces = [];   // things a grid can be placed on
+
+function addSurface(geo, mat, pos, rotY = 0, rotX = 0) {
+  const m = new THREE.Mesh(geo, mat);
+  m.position.copy(pos);
+  m.rotation.set(rotX, rotY, 0);
+  room.add(m);
+  surfaces.push(m);
+  return m;
+}
+const H2 = ROOM_H / 2;
+addSurface(new THREE.PlaneGeometry(ROOM_W, ROOM_H), wallMat, new THREE.Vector3(0, H2, -ROOM_D / 2), 0);            // back
+addSurface(new THREE.PlaneGeometry(ROOM_W, ROOM_H), wallMat, new THREE.Vector3(0, H2, ROOM_D / 2), Math.PI);      // front
+addSurface(new THREE.PlaneGeometry(ROOM_D, ROOM_H), wallMat, new THREE.Vector3(-ROOM_W / 2, H2, 0), Math.PI / 2); // left
+addSurface(new THREE.PlaneGeometry(ROOM_D, ROOM_H), wallMat, new THREE.Vector3(ROOM_W / 2, H2, 0), -Math.PI / 2); // right
+addSurface(new THREE.PlaneGeometry(ROOM_W, ROOM_D), floorMat, new THREE.Vector3(0, 0, 0), 0, -Math.PI / 2);     // floor
+
+// ---- Grids ----
+const gridsGroup = new THREE.Group();
+scene.add(gridsGroup);
+const grids = [];   // { group, cells }
+
+const gridMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3, side: THREE.DoubleSide });
+const panelMat = new THREE.MeshStandardMaterial({ color: 0x1a3c7a, metalness: 0.4, roughness: 0.3, side: THREE.DoubleSide });
+const cellGeo = new THREE.PlaneGeometry(CELL * 0.92, CELL * 0.92);
+
+// Orientation whose local +Z points along the surface normal and whose local +Y is "up" where possible.
+function quatFromNormal(n) {
+  const up = Math.abs(n.y) > 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(0, 1, 0);
+  const x = new THREE.Vector3().crossVectors(up, n).normalize();
+  const y = new THREE.Vector3().crossVectors(n, x).normalize();
+  const m = new THREE.Matrix4().makeBasis(x, y, n);
+  return new THREE.Quaternion().setFromRotationMatrix(m);
+}
+
+function addGrid(center, normal) {
+  const group = new THREE.Group();
+  group.quaternion.copy(quatFromNormal(normal));
+  group.position.copy(center).addScaledVector(normal, 0.02);   // sit just off the surface
+
+  const rec = { group, cells: [] };
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const m = new THREE.Mesh(cellGeo, gridMat);
+      m.position.set((c - (COLS - 1) / 2) * CELL, (r - (ROWS - 1) / 2) * CELL, 0);
+      m.userData = { panel: false, grid: rec };
+      group.add(m);
+      rec.cells.push(m);
+    }
+  }
+  gridsGroup.add(group);
+  grids.push(rec);
+  updateStats();
+  return rec;
+}
+
+function togglePanel(cell) {
+  cell.userData.panel = !cell.userData.panel;
+  cell.material = cell.userData.panel ? panelMat : gridMat;
+  updateStats();
+}
+
+function deleteGrid(rec) {
+  gridsGroup.remove(rec.group);
+  grids.splice(grids.indexOf(rec), 1);
+  updateStats();
+}
+
+function allCells() { return grids.flatMap(g => g.cells); }
+
+function updateStats() {
+  const panels = allCells().filter(m => m.userData.panel).length;
+  const area = panels * CELL * CELL;
+  document.getElementById('stats').textContent =
+    `Grids: ${grids.length} · Panel cells: ${panels} · Panel area: ${area.toFixed(2)} m²`;
+}
+
+// ---- Modes (desktop) ----
+const btn = { grid: document.getElementById('btnGrid'), panel: document.getElementById('btnPanel'), delete: document.getElementById('btnDelete') };
+const hintEl = document.getElementById('hint');
+const hints = {
+  grid:   'Tap a wall or the floor to place a 3 m × 2 m grid. Drag to orbit, scroll to zoom.',
+  panel:  'Tap a cell to add or remove a solar panel.',
+  delete: 'Tap any cell to delete its whole grid.',
+};
+let mode = 'grid';
+function setMode(m) {
+  mode = m;
+  for (const k of Object.keys(btn)) btn[k].classList.toggle('on', k === m);
+  hintEl.textContent = hints[m];
+}
+btn.grid.onclick = () => setMode('grid');
+btn.panel.onclick = () => setMode('panel');
+btn.delete.onclick = () => setMode('delete');
+setMode('grid');
+
+// ---- Picking ----
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+function pick(clientX, clientY, objects) {
+  const r = renderer.domElement.getBoundingClientRect();
+  ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  return raycaster.intersectObjects(objects, false)[0];
+}
+
+// Tap vs drag: only treat pointerup as a tap if the pointer barely moved.
+let pressAt = null;
+renderer.domElement.addEventListener('pointerdown', e => { pressAt = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!pressAt || arActive) return;
+  const moved = Math.hypot(e.clientX - pressAt.x, e.clientY - pressAt.y) > 6;
+  pressAt = null;
+  if (!moved) onTap(e.clientX, e.clientY);
+});
+
+function onTap(x, y) {
+  if (mode === 'grid') {
+    const hit = pick(x, y, surfaces);
+    if (!hit) return;
+    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(hit.object.quaternion).normalize();
+    addGrid(hit.point, n);
+    return;
+  }
+  const hit = pick(x, y, allCells());
+  if (!hit) return;
+  if (mode === 'panel') togglePanel(hit.object);
+  else if (mode === 'delete') deleteGrid(hit.object.userData.grid);
+}
+
+// ---- AR mode (WebXR, Android Chrome with ARCore) ----
+const btnAR = document.getElementById('btnAR');
+let xrSession = null, hitSource = null, arActive = false, lastHit = null;
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.08, 0.1, 32).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0x33ff66 })
+);
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+btnAR.onclick = startAR;
+
+async function startAR() {
+  if (!navigator.xr) {
+    alert('WebXR is not available. Open this page over HTTPS in Chrome on an ARCore-supported Android phone.');
+    return;
+  }
+  if (!(await navigator.xr.isSessionSupported('immersive-ar'))) {
+    alert('AR is not supported on this device/browser.');
+    return;
+  }
+  try {
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test'],
+      optionalFeatures: ['dom-overlay'],
+      domOverlay: { root: document.body },
+    });
+    xrSession = session;
+    await renderer.xr.setSession(session);
+
+    const viewerSpace = await session.requestReferenceSpace('viewer');
+    hitSource = await session.requestHitTestSource({ space: viewerSpace });
+
+    arActive = true;
+    room.visible = false;            // the real room replaces the virtual one
+    scene.background = null;
+    hintEl.textContent = 'Point at a wall or floor until the green ring appears, then tap to place a grid.';
+    session.addEventListener('select', onARSelect);
+    session.addEventListener('end', () => {
+      if (hitSource) hitSource.cancel();
+      hitSource = null;
+      xrSession = null;
+      arActive = false;
+      lastHit = null;
+      reticle.visible = false;
+      room.visible = true;
+      scene.background = new THREE.Color(0x1d2026);
+      setMode(mode);
+    });
+  } catch (err) {
+    alert('Could not start AR: ' + err.message);
+  }
+}
+
+function onARSelect() {
+  if (!lastHit) return;
+  const m = new THREE.Matrix4().fromArray(lastHit);
+  const pos = new THREE.Vector3().setFromMatrixPosition(m);
+  const normal = new THREE.Vector3().setFromMatrixColumn(m, 1).normalize();  // hit-test Y = surface normal
+  addGrid(pos, normal);
+}
+
+// ---- Loop ----
+function render(_time, frame) {
+  if (arActive && frame && hitSource) {
+    const results = frame.getHitTestResults(hitSource);
+    lastHit = null;
+    if (results.length) {
+      const pose = results[0].getPose(renderer.xr.getReferenceSpace());
+      if (pose) {
+        lastHit = Array.from(pose.transform.matrix);
+        reticle.matrix.fromArray(lastHit);
+        reticle.visible = true;
+      }
+    }
+    if (!lastHit) reticle.visible = false;
+  } else if (!arActive) {
+    controls.update();
+  }
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(render);
+
+updateStats();
+</script>
+</body>
+</html>
